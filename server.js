@@ -105,11 +105,24 @@ const initializeClient = () => {
   });
 
   client.on('qr', (qr) => {
-    console.log('📱 QR Code received');
+    console.log('📱 QR Code received, generating image...');
     connectionStatus = 'qr_ready';
-    QRCode.toDataURL(qr, (err, url) => {
+    QRCode.toDataURL(qr, { 
+      errorCorrectionLevel: 'M',
+      type: 'image/png',
+      quality: 0.92,
+      margin: 1,
+      color: {
+        dark: '#000000',
+        light: '#FFFFFF'
+      },
+      width: 256
+    }, (err, url) => {
       if (!err) {
         qrCodeData = url;
+        console.log('✅ QR Code generated successfully');
+      } else {
+        console.error('❌ QR Code generation failed:', err);
       }
     });
   });
@@ -152,6 +165,8 @@ const initializeClient = () => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
+    version: 'NO_EMOJIS_V2.0.1',
+    message_format: 'CLEAN_NO_EMOJIS',
     timestamp: new Date().toISOString(),
     whatsapp_status: connectionStatus,
     client_ready: isClientReady,
@@ -184,6 +199,35 @@ app.get('/api/qr', (req, res) => {
       message: 'QR code not available. Status: ' + connectionStatus
     });
   }
+});
+
+// Reset WhatsApp session
+app.post('/api/reset', (req, res) => {
+  console.log('🔄 Resetting WhatsApp session...');
+  
+  // Clear current state
+  qrCodeData = null;
+  isClientReady = false;
+  connectionStatus = 'resetting';
+  
+  // Destroy client if exists
+  if (client) {
+    try {
+      client.destroy();
+    } catch (error) {
+      console.error('Error destroying client:', error);
+    }
+  }
+  
+  // Reinitialize after a short delay
+  setTimeout(() => {
+    initializeClient();
+  }, 2000);
+  
+  res.json({
+    success: true,
+    message: 'WhatsApp session reset initiated. Get a new QR code in a few seconds.'
+  });
 });
 
 // Send bulk messages
@@ -264,6 +308,11 @@ app.post('/api/send-event-messages', async (req, res) => {
 
   const messages = staff_list.map(staff => {
     const message = formatEventMessage(event, staff);
+    console.log('=== FORMATTED MESSAGE DEBUG ===');
+    console.log('Raw event data:', JSON.stringify(event, null, 2));
+    console.log('Staff data:', JSON.stringify(staff, null, 2));
+    console.log('Generated message:', message);
+    console.log('=== END DEBUG ===');
     return {
       number: staff.mobile_number,
       message: message
@@ -387,82 +436,126 @@ app.get('/api/queue', (req, res) => {
 // Message formatting functions
 const formatEventMessage = (event, staff) => {
   const formatDate = (dateString) => {
-    const date = new Date(dateString);
-    return date.toLocaleDateString('en-IN', {
-      weekday: 'long',
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric',
-    });
+    if (!dateString || dateString === 'undefined' || dateString === 'null') {
+      return 'Date not specified';
+    }
+    
+    try {
+      let date;
+      
+      // If it's in YYYY-MM-DD format, add time to avoid timezone issues
+      if (typeof dateString === 'string' && dateString.match(/^\d{4}-\d{2}-\d{2}$/)) {
+        date = new Date(dateString + 'T00:00:00');
+      } else {
+        date = new Date(dateString);
+      }
+      
+      if (isNaN(date.getTime())) {
+        console.warn('Invalid date string:', dateString);
+        return 'Invalid date';
+      }
+      
+      return date.toLocaleDateString('en-IN', {
+        weekday: 'long',
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+      });
+    } catch (error) {
+      console.error('Error formatting date:', dateString, error);
+      return 'Date formatting error';
+    }
   };
 
-  let message = `*🎉 EVENT ASSIGNMENT*\n\n`;
-  message += `Hi *${staff.full_name}*!\n\n`;
+  // VERSION: NO_EMOJIS_V2.0.1 - ABSOLUTELY NO EMOJIS OR DECORATIVE CHARACTERS
+  let message = `*EVENT ASSIGNMENT*\n\n`;
+  message += `Hello *${staff.full_name}*,\n\n`;
   message += `You have been assigned as *${staff.role.toUpperCase()}* for the following event:\n\n`;
-  message += `*📅 Event:* ${event.title}\n`;
-  message += `*🎭 Type:* ${event.event_type}\n`;
-  message += `*📍 Date:* ${formatDate(event.event_date)}\n`;
+  message += `*Event Title:* ${event.title || 'Not specified'}\n`;
+  message += `*Event Type:* ${event.eventType || event.event_type || 'Not specified'}\n`;
+  message += `*Event Date:* ${formatDate(event.eventDate || event.event_date)}\n`;
 
-  if (event.venue) {
-    message += `*🏢 Venue:* ${event.venue}\n`;
+  if (event.venue && event.venue.trim() !== '') {
+    message += `*Venue:* ${event.venue}\n`;
   }
 
-  if (event.client_name) {
-    message += `*👤 Client:* ${event.client_name}\n`;
+  if (event.clientName || event.client_name) {
+    message += `*Client Name:* ${event.clientName || event.client_name}\n`;
   }
 
-  if (event.total_days && event.total_days > 1) {
-    message += `*⏱️ Duration:* ${event.total_days} days\n`;
+  if ((event.totalDays || event.total_days) && (event.totalDays > 1 || event.total_days > 1)) {
+    message += `*Event Duration:* ${event.totalDays || event.total_days} days\n`;
   }
 
-  if (event.description) {
-    message += `*📋 Details:*\n${event.description}\n`;
+  if (event.description && event.description.trim() !== '') {
+    message += `\n*Additional Details:*\n_${event.description}_\n`;
   }
 
-  message += `\n✅ Please confirm your availability by replying to this message.\n`;
-  message += `❓ For any queries, contact the admin immediately.\n\n`;
-  message += `_Thank you for being part of our team!_ 🙏`;
+  message += `\nThank you for your professionalism and commitment.`;
+
+  console.log('MESSAGE VERSION: NO_EMOJIS_V2.0.1');
+  console.log('Generated clean message:', message);
 
   return message;
 };
 
 const formatTaskMessage = (task, staff) => {
   const formatDate = (dateString) => {
-    const date = new Date(dateString);
-    return date.toLocaleDateString('en-IN', {
-      weekday: 'long',
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric',
-    });
+    if (!dateString || dateString === 'undefined' || dateString === 'null') {
+      return 'Date not specified';
+    }
+    
+    try {
+      let date;
+      
+      // If it's in YYYY-MM-DD format, add time to avoid timezone issues
+      if (typeof dateString === 'string' && dateString.match(/^\d{4}-\d{2}-\d{2}$/)) {
+        date = new Date(dateString + 'T00:00:00');
+      } else {
+        date = new Date(dateString);
+      }
+      
+      if (isNaN(date.getTime())) {
+        console.warn('Invalid date string:', dateString);
+        return 'Invalid date';
+      }
+      
+      return date.toLocaleDateString('en-IN', {
+        weekday: 'long',
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+      });
+    } catch (error) {
+      console.error('Error formatting date:', dateString, error);
+      return 'Date formatting error';
+    }
   };
 
-  let message = `*📋 TASK ASSIGNMENT*\n\n`;
-  message += `Hi *${staff.full_name}*!\n\n`;
+  let message = `*TASK ASSIGNMENT*\n\n`;
+  message += `Hello *${staff.full_name}*,\n\n`;
   message += `You have been assigned a new task:\n\n`;
-  message += `*🎯 Task:* ${task.title}\n`;
-  message += `*📝 Type:* ${task.task_type || 'General'}\n`;
-  message += `*⚡ Priority:* ${task.priority || 'Medium'}\n`;
+  message += `*Task Title:* ${task.title || 'Not specified'}\n`;
+  message += `*Task Type:* ${task.taskType || task.task_type || 'General'}\n`;
+  message += `*Priority:* ${task.priority || 'Medium'}\n`;
 
-  if (task.due_date) {
-    message += `*📅 Due Date:* ${formatDate(task.due_date)}\n`;
+  if (task.dueDate || task.due_date) {
+    message += `*Due Date:* ${formatDate(task.dueDate || task.due_date)}\n`;
   }
 
-  if (task.event_title) {
-    message += `*🎭 Related Event:* ${task.event_title}\n`;
+  if (task.eventTitle || task.event_title) {
+    message += `*Related Event:* ${task.eventTitle || task.event_title}\n`;
   }
 
   if (task.amount && task.amount > 0) {
-    message += `*💰 Amount:* ₹${task.amount.toLocaleString()}\n`;
+    message += `*Compensation:* ₹${task.amount.toLocaleString()}\n`;
   }
 
-  if (task.description) {
-    message += `\n*📖 Description:*\n${task.description}\n`;
+  if (task.description && task.description.trim() !== '') {
+    message += `\n*Task Description:*\n_${task.description}_\n`;
   }
 
-  message += `\n✅ Please acknowledge this task by replying to this message.\n`;
-  message += `❓ Contact admin for any clarifications.\n\n`;
-  message += `_Thank you for your cooperation!_ 🙏`;
+  message += `\nThank you for your professionalism.`;
 
   return message;
 };
