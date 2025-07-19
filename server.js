@@ -165,8 +165,6 @@ const initializeClient = () => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: 'NO_EMOJIS_V2.0.1',
-    message_format: 'CLEAN_NO_EMOJIS',
     timestamp: new Date().toISOString(),
     whatsapp_status: connectionStatus,
     client_ready: isClientReady,
@@ -308,11 +306,6 @@ app.post('/api/send-event-messages', async (req, res) => {
 
   const messages = staff_list.map(staff => {
     const message = formatEventMessage(event, staff);
-    console.log('=== FORMATTED MESSAGE DEBUG ===');
-    console.log('Raw event data:', JSON.stringify(event, null, 2));
-    console.log('Staff data:', JSON.stringify(staff, null, 2));
-    console.log('Generated message:', message);
-    console.log('=== END DEBUG ===');
     return {
       number: staff.mobile_number,
       message: message
@@ -467,10 +460,9 @@ const formatEventMessage = (event, staff) => {
     }
   };
 
-  // VERSION: NO_EMOJIS_V2.0.1 - ABSOLUTELY NO EMOJIS OR DECORATIVE CHARACTERS
   let message = `*EVENT ASSIGNMENT*\n\n`;
   message += `Hello *${staff.full_name}*,\n\n`;
-  message += `You have been assigned as *${staff.role.toUpperCase()}* for the following event:\n\n`;
+  message += `You have been assigned as *${(event.role || staff.role || 'STAFF').toUpperCase()}* for the following event:\n\n`;
   message += `*Event Title:* ${event.title || 'Not specified'}\n`;
   message += `*Event Type:* ${event.eventType || event.event_type || 'Not specified'}\n`;
   message += `*Event Date:* ${formatDate(event.eventDate || event.event_date)}\n`;
@@ -492,9 +484,6 @@ const formatEventMessage = (event, staff) => {
   }
 
   message += `\nThank you for your professionalism and commitment.`;
-
-  console.log('MESSAGE VERSION: NO_EMOJIS_V2.0.1');
-  console.log('Generated clean message:', message);
 
   return message;
 };
