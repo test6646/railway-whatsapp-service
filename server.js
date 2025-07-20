@@ -514,37 +514,55 @@ const formatEventMessage = (event, staff, assignment) => {
     return num + (suffixes[(v - 20) % 10] || suffixes[v] || suffixes[0]);
   };
 
-  let message = `*EVENT ASSIGNMENT*\n\n`;
-  message += `Hello *${staff.full_name}*,\n\n`;
+  let message = `**EVENT ASSIGNMENT**\n\n`;
+  message += `Hello **${staff.full_name}**,\n\n`;
 
   // Enhanced role assignment with bold formatting
   if (assignment) {
     const dayText = getOrdinalNumber(assignment.day_number);
     message += `You are assigned as **${assignment.role.toUpperCase()}** on **DAY ${dayText.toUpperCase()}** for:\n\n`;
-    message += `*Event Title:* ${event.title || 'Not specified'}\n`;
-    message += `*Event Type:* ${event.eventType || event.event_type || 'Not specified'}\n`;
-    message += `*Day ${assignment.day_number} Date:* ${formatDate(assignment.day_date)}\n`;
+    message += `**TITLE:** ${event.title || 'Not specified'}\n`;
+    message += `**TYPE:** ${event.eventType || event.event_type || 'Not specified'}\n`;
+    message += `**DATE:** ${formatDate(assignment.day_date)}\n`;
   } else {
     message += `You have been assigned as **${(event.role || staff.role || 'STAFF').toUpperCase()}** for the following event:\n\n`;
-    message += `*Event Title:* ${event.title || 'Not specified'}\n`;
-    message += `*Event Type:* ${event.eventType || event.event_type || 'Not specified'}\n`;
-    message += `*Event Date:* ${formatDate(event.eventDate || event.event_date)}\n`;
+    message += `**TITLE:** ${event.title || 'Not specified'}\n`;
+    message += `**TYPE:** ${event.eventType || event.event_type || 'Not specified'}\n`;
+    
+    // Format date range for multi-day events
+    if ((event.totalDays || event.total_days) && (event.totalDays > 1 || event.total_days > 1)) {
+      const startDate = new Date((event.eventDate || event.event_date) + 'T00:00:00');
+      const endDate = new Date(startDate);
+      endDate.setDate(startDate.getDate() + (event.totalDays || event.total_days) - 1);
+      
+      const startFormatted = startDate.toLocaleDateString('en-IN', {
+        day: 'numeric',
+        month: 'short',
+        year: 'numeric'
+      });
+      const endFormatted = endDate.toLocaleDateString('en-IN', {
+        day: 'numeric', 
+        month: 'short',
+        year: 'numeric'
+      });
+      
+      message += `**DATE:** ${startFormatted} - ${endFormatted}\n`;
+      message += `**DAYS:** ${event.totalDays || event.total_days}\n`;
+    } else {
+      message += `**DATE:** ${formatDate(event.eventDate || event.event_date)}\n`;
+    }
   }
 
   if (event.venue && event.venue.trim() !== '') {
-    message += `*Venue:* ${event.venue}\n`;
+    message += `**VENUE:** ${event.venue}\n`;
   }
 
   if (event.clientName || event.client_name) {
-    message += `*Client Name:* ${event.clientName || event.client_name}\n`;
-  }
-
-  if ((event.totalDays || event.total_days) && (event.totalDays > 1 || event.total_days > 1)) {
-    message += `*Total Event Duration:* ${event.totalDays || event.total_days} days\n`;
+    message += `**CLIENT:** ${event.clientName || event.client_name}\n`;
   }
 
   if (event.description && event.description.trim() !== '') {
-    message += `\n*Additional Details:*\n_${event.description}_\n`;
+    message += `\n**DETAILS:**\n_${event.description}_\n`;
   }
 
   message += `\nThank you for your professionalism and commitment.`;
@@ -585,27 +603,27 @@ const formatTaskMessage = (task, staff) => {
     }
   };
 
-  let message = `*TASK ASSIGNMENT*\n\n`;
-  message += `Hello *${staff.full_name}*,\n\n`;
+  let message = `**TASK ASSIGNMENT**\n\n`;
+  message += `Hello **${staff.full_name}**,\n\n`;
   message += `You have been assigned a new task:\n\n`;
-  message += `*Task Title:* ${task.title || 'Not specified'}\n`;
-  message += `*Task Type:* ${task.taskType || task.task_type || 'General'}\n`;
-  message += `*Priority:* ${task.priority || 'Medium'}\n`;
+  message += `**TITLE:** ${task.title || 'Not specified'}\n`;
+  message += `**TYPE:** ${task.taskType || task.task_type || 'General'}\n`;
+  message += `**PRIORITY:** ${task.priority || 'Medium'}\n`;
 
   if (task.dueDate || task.due_date) {
-    message += `*Due Date:* ${formatDate(task.dueDate || task.due_date)}\n`;
+    message += `**DUE:** ${formatDate(task.dueDate || task.due_date)}\n`;
   }
 
   if (task.eventTitle || task.event_title) {
-    message += `*Related Event:* ${task.eventTitle || task.event_title}\n`;
+    message += `**EVENT:** ${task.eventTitle || task.event_title}\n`;
   }
 
   if (task.amount && task.amount > 0) {
-    message += `*Compensation:* ₹${task.amount.toLocaleString()}\n`;
+    message += `**AMOUNT:** ₹${task.amount.toLocaleString()}\n`;
   }
 
   if (task.description && task.description.trim() !== '') {
-    message += `\n*Task Description:*\n_${task.description}_\n`;
+    message += `\n**DETAILS:**\n_${task.description}_\n`;
   }
 
   message += `\nThank you for your professionalism.`;
