@@ -288,7 +288,7 @@ app.post('/api/send-bulk-messages', async (req, res) => {
 
 // Send event notifications
 app.post('/api/send-event-messages', async (req, res) => {
-  const { event, staff_list } = req.body;
+  const { event, staff_list, staff_assignments } = req.body;
 
   if (!event || !Array.isArray(staff_list) || staff_list.length === 0) {
     return res.status(400).json({
@@ -304,13 +304,58 @@ app.post('/api/send-event-messages', async (req, res) => {
     });
   }
 
-  const messages = staff_list.map(staff => {
-    const message = formatEventMessage(event, staff);
-    return {
-      number: staff.mobile_number,
-      message: message
-    };
+  // Group staff assignments by staff and day, then sort by day number
+  const staffDayAssignments = {};
+  
+  if (staff_assignments && Array.isArray(staff_assignments)) {
+    staff_assignments.forEach(assignment => {
+      if (!staffDayAssignments[assignment.staff_id]) {
+        staffDayAssignments[assignment.staff_id] = [];
+      }
+      staffDayAssignments[assignment.staff_id].push({
+        day_number: assignment.day_number,
+        day_date: assignment.day_date,
+        role: assignment.role
+      });
+    });
+    
+    // Sort assignments for each staff by day number
+    Object.keys(staffDayAssignments).forEach(staffId => {
+      staffDayAssignments[staffId].sort((a, b) => a.day_number - b.day_number);
+    });
+  }
+
+  // Generate messages for each staff member and each day (for multi-day events)
+  const messages = [];
+  
+  staff_list.forEach(staff => {
+    const assignments = staffDayAssignments[staff.id] || [];
+    
+    if (assignments.length > 0) {
+      // For multi-day events, send one message per day (ordered by day)
+      assignments.forEach(assignment => {
+        const message = formatEventMessage(event, staff, assignment);
+        messages.push({
+          number: staff.mobile_number,
+          message: message,
+          staff_id: staff.id,
+          day_number: assignment.day_number
+        });
+      });
+    } else {
+      // Fallback for single events or when no assignments data
+      const message = formatEventMessage(event, staff, null);
+      messages.push({
+        number: staff.mobile_number,
+        message: message,
+        staff_id: staff.id,
+        day_number: 1
+      });
+    }
   });
+
+  // Sort messages by day number to ensure earliest days are sent first
+  messages.sort((a, b) => a.day_number - b.day_number);
 
   // Use existing bulk message endpoint logic
   const results = [];
@@ -323,12 +368,15 @@ app.post('/api/send-event-messages', async (req, res) => {
       message: msg.message,
       timestamp: new Date().toISOString(),
       type: 'event',
-      event_id: event.id
+      event_id: event.id,
+      staff_id: msg.staff_id,
+      day_number: msg.day_number
     });
 
     results.push({
       index,
-      staff_id: staff_list[index].id,
+      staff_id: msg.staff_id,
+      day_number: msg.day_number,
       success: true,
       message_id: messageId,
       status: 'queued'
@@ -427,7 +475,7 @@ app.get('/api/queue', (req, res) => {
 });
 
 // Message formatting functions
-const formatEventMessage = (event, staff) => {
+const formatEventMessage = (event, staff, assignment) => {
   const formatDate = (dateString) => {
     if (!dateString || dateString === 'undefined' || dateString === 'null') {
       return 'Date not specified';
@@ -460,12 +508,28 @@ const formatEventMessage = (event, staff) => {
     }
   };
 
+  const getOrdinalNumber = (num) => {
+    const suffixes = ['th', 'st', 'nd', 'rd'];
+    const v = num % 100;
+    return num + (suffixes[(v - 20) % 10] || suffixes[v] || suffixes[0]);
+  };
+
   let message = `*EVENT ASSIGNMENT*\n\n`;
   message += `Hello *${staff.full_name}*,\n\n`;
-  message += `You have been assigned as *${(event.role || staff.role || 'STAFF').toUpperCase()}* for the following event:\n\n`;
-  message += `*Event Title:* ${event.title || 'Not specified'}\n`;
-  message += `*Event Type:* ${event.eventType || event.event_type || 'Not specified'}\n`;
-  message += `*Event Date:* ${formatDate(event.eventDate || event.event_date)}\n`;
+
+  // Enhanced role assignment with bold formatting
+  if (assignment) {
+    const dayText = getOrdinalNumber(assignment.day_number);
+    message += `You are assigned as **${assignment.role.toUpperCase()}** on **DAY ${dayText.toUpperCase()}** for:\n\n`;
+    message += `*Event Title:* ${event.title || 'Not specified'}\n`;
+    message += `*Event Type:* ${event.eventType || event.event_type || 'Not specified'}\n`;
+    message += `*Day ${assignment.day_number} Date:* ${formatDate(assignment.day_date)}\n`;
+  } else {
+    message += `You have been assigned as **${(event.role || staff.role || 'STAFF').toUpperCase()}** for the following event:\n\n`;
+    message += `*Event Title:* ${event.title || 'Not specified'}\n`;
+    message += `*Event Type:* ${event.eventType || event.event_type || 'Not specified'}\n`;
+    message += `*Event Date:* ${formatDate(event.eventDate || event.event_date)}\n`;
+  }
 
   if (event.venue && event.venue.trim() !== '') {
     message += `*Venue:* ${event.venue}\n`;
@@ -476,7 +540,7 @@ const formatEventMessage = (event, staff) => {
   }
 
   if ((event.totalDays || event.total_days) && (event.totalDays > 1 || event.total_days > 1)) {
-    message += `*Event Duration:* ${event.totalDays || event.total_days} days\n`;
+    message += `*Total Event Duration:* ${event.totalDays || event.total_days} days\n`;
   }
 
   if (event.description && event.description.trim() !== '') {
