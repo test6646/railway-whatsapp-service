@@ -416,12 +416,23 @@ const formatEventMessage = (event, staff, assignment) => {
   message += `Hello *${staff.full_name}*,\n\n`;
   if (assignment) {
     const dayText = getOrdinalNumber(assignment.day_number);
-    message += `You are assigned as *${assignment.role.toUpperCase()}* on *DAY ${dayText}* for:\n\n`;
+    message += `You are assigned as *${assignment.role.toUpperCase()}* on *DAY ${dayText}* for the following event:\n\n`;
     message += `*Title*: ${event.title || 'Not specified'}\n`;
     message += `*Type*: ${event.eventType || event.event_type || 'Not specified'}\n`;
-    message += `*Date*: ${formatDate(assignment.day_date)}\n`;
+    
+    // For multi-day events, show full date range
+    if ((event.totalDays || event.total_days) && (event.totalDays > 1 || event.total_days > 1)) {
+      const startDate = new Date((event.eventDate || event.event_date) + 'T00:00:00');
+      const endDate = new Date(startDate);
+      endDate.setDate(startDate.getDate() + (event.totalDays || event.total_days) - 1);
+      const startFormatted = startDate.toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+      const endFormatted = endDate.toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' });
+      message += `*Date*: ${startFormatted} - ${endFormatted}\n`;
+    } else {
+      message += `*Date*: ${formatDate(assignment.day_date)}\n`;
+    }
   } else {
-    message += `You are assigned as *${(event.role || staff.role || 'STAFF').toUpperCase()}* for:\n\n`;
+    message += `You are assigned as *${(event.role || staff.role || 'STAFF').toUpperCase()}* for the following event:\n\n`;
     message += `*Title*: ${event.title || 'Not specified'}\n`;
     message += `*Type*: ${event.eventType || event.event_type || 'Not specified'}\n`;
     if ((event.totalDays || event.total_days) && (event.totalDays > 1 || event.total_days > 1)) {
@@ -443,7 +454,7 @@ const formatEventMessage = (event, staff, assignment) => {
   }
   message += `*Contact*: ${staff.mobile_number}\n`;
   if (event.description && event.description.trim() !== '') {
-    message += `\n${event.description}\n`;
+    message += `\n_${event.description}_\n`;
   }
   message += `\nThank you for being part of *Prit Photo*`;
   return message;
