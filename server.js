@@ -23,26 +23,44 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
-// Global variables
-let client;
-let qrCodeData = null;
-let isClientReady = false;
-let connectionStatus = 'initializing';
-let messageQueue = [];
-let isProcessingQueue = false;
+// Session-based storage
+const sessions = new Map(); // sessionId -> { client, qrCode, isReady, status, messageQueue }
+const SESSION_TIMEOUT = 24 * 60 * 60 * 1000; // 24 hours
 
-// Message queue processing
-const processMessageQueue = async () => {
-  if (isProcessingQueue || messageQueue.length === 0 || !isClientReady) return;
-  isProcessingQueue = true;
-  console.log(`Processing ${messageQueue.length} messages in queue`);
-  while (messageQueue.length > 0 && isClientReady) {
-    const messageData = messageQueue.shift();
+// Session management
+const getSession = (sessionId) => {
+  if (!sessionId) return null;
+  
+  if (!sessions.has(sessionId)) {
+    sessions.set(sessionId, {
+      client: null,
+      qrCode: null,
+      isReady: false,
+      status: 'initializing',
+      messageQueue: [],
+      isProcessingQueue: false,
+      createdAt: Date.now()
+    });
+  }
+  
+  return sessions.get(sessionId);
+};
+
+// Session-specific message queue processing
+const processMessageQueue = async (sessionId) => {
+  const session = getSession(sessionId);
+  if (!session || session.isProcessingQueue || session.messageQueue.length === 0 || !session.isReady) return;
+  
+  session.isProcessingQueue = true;
+  console.log(`Processing ${session.messageQueue.length} messages for session ${sessionId}`);
+  
+  while (session.messageQueue.length > 0 && session.isReady) {
+    const messageData = session.messageQueue.shift();
     try {
       const formattedNumber = formatPhoneNumber(messageData.number);
       const chatId = formattedNumber + '@c.us';
-      await client.sendMessage(chatId, messageData.message);
-      console.log(`✅ Message sent to ${formattedNumber}`);
+      await session.client.sendMessage(chatId, messageData.message);
+      console.log(`✅ Message sent to ${formattedNumber} (session: ${sessionId})`);
       if (messageData.statusCallback) messageData.statusCallback('sent');
       await new Promise(resolve => setTimeout(resolve, 2000));
     } catch (error) {
@@ -50,8 +68,8 @@ const processMessageQueue = async () => {
       if (messageData.statusCallback) messageData.statusCallback('failed', error.message);
     }
   }
-  isProcessingQueue = false;
-  console.log('✅ Queue processing completed');
+  session.isProcessingQueue = false;
+  console.log(`✅ Queue processing completed for session ${sessionId}`);
 };
 
 // Format phone number to international format
@@ -63,11 +81,14 @@ const formatPhoneNumber = (phone) => {
   return digits;
 };
 
-// Initialize WhatsApp client
-const initializeClient = () => {
-  console.log('🚀 Initializing WhatsApp client...');
-  client = new Client({
-    authStrategy: new LocalAuth({ dataPath: './whatsapp-session' }),
+// Initialize WhatsApp client for specific session
+const initializeClient = (sessionId) => {
+  console.log(`🚀 Initializing WhatsApp client for session: ${sessionId}`);
+  const session = getSession(sessionId);
+  if (!session) return;
+
+  session.client = new Client({
+    authStrategy: new LocalAuth({ dataPath: `./whatsapp-session-${sessionId}` }),
     puppeteer: {
       headless: true,
       args: [
@@ -82,9 +103,10 @@ const initializeClient = () => {
       ]
     }
   });
-  client.on('qr', (qr) => {
-    console.log('📱 QR Code received, generating image...');
-    connectionStatus = 'qr_ready';
+
+  session.client.on('qr', (qr) => {
+    console.log(`📱 QR Code received for session: ${sessionId}`);
+    session.status = 'qr_ready';
     QRCode.toDataURL(qr, {
       errorCorrectionLevel: 'M',
       type: 'image/png',
@@ -94,110 +116,200 @@ const initializeClient = () => {
       width: 256
     }, (err, url) => {
       if (!err) {
-        qrCodeData = url;
-        console.log('✅ QR Code generated successfully');
+        session.qrCode = url;
+        console.log(`✅ QR Code generated for session: ${sessionId}`);
       } else {
-        console.error('❌ QR Code generation failed:', err);
+        console.error(`❌ QR Code generation failed for session ${sessionId}:`, err);
       }
     });
   });
-  client.on('ready', () => {
-    console.log('✅ WhatsApp client is ready!');
-    isClientReady = true;
-    connectionStatus = 'ready';
-    qrCodeData = null;
+
+  session.client.on('ready', () => {
+    console.log(`✅ WhatsApp client ready for session: ${sessionId}`);
+    session.isReady = true;
+    session.status = 'ready';
+    session.qrCode = null;
   });
-  client.on('authenticated', () => {
-    console.log('✅ WhatsApp client authenticated');
-    connectionStatus = 'authenticated';
+
+  session.client.on('authenticated', () => {
+    console.log(`✅ WhatsApp client authenticated for session: ${sessionId}`);
+    session.status = 'authenticated';
   });
-  client.on('auth_failure', (msg) => {
-    console.error('❌ Authentication failed:', msg);
-    connectionStatus = 'auth_failed';
+
+  session.client.on('auth_failure', (msg) => {
+    console.error(`❌ Authentication failed for session ${sessionId}:`, msg);
+    session.status = 'auth_failed';
   });
-  client.on('disconnected', (reason) => {
-    console.log('⚠️ WhatsApp client disconnected:', reason);
-    isClientReady = false;
-    connectionStatus = 'disconnected';
+
+  session.client.on('disconnected', (reason) => {
+    console.log(`⚠️ WhatsApp client disconnected for session ${sessionId}:`, reason);
+    session.isReady = false;
+    session.status = 'disconnected';
     setTimeout(() => {
-      console.log('🔄 Attempting to reconnect...');
-      initializeClient();
+      console.log(`🔄 Attempting to reconnect session: ${sessionId}`);
+      initializeClient(sessionId);
     }, 5000);
   });
-  client.initialize();
+
+  session.client.initialize();
+};
+
+// Clean up old sessions
+const cleanupOldSessions = () => {
+  const now = Date.now();
+  for (const [sessionId, session] of sessions.entries()) {
+    if (now - session.createdAt > SESSION_TIMEOUT) {
+      console.log(`🧹 Cleaning up old session: ${sessionId}`);
+      if (session.client) {
+        try { session.client.destroy(); } catch (e) { console.error('Error destroying client:', e); }
+      }
+      sessions.delete(sessionId);
+    }
+  }
 };
 
 // Routes
 
 // Health check
 app.get('/health', (req, res) => {
+  const activeSessions = Array.from(sessions.entries()).map(([id, session]) => ({
+    id: id.substring(0, 20) + '...',
+    status: session.status,
+    ready: session.isReady,
+    queue_length: session.messageQueue.length
+  }));
+
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    whatsapp_status: connectionStatus,
-    client_ready: isClientReady,
-    queue_length: messageQueue.length
+    active_sessions: activeSessions.length,
+    sessions: activeSessions
   });
 });
 
-// Get connection status
-app.get('/api/status', (req, res) => {
+// Get connection status for specific session
+app.get('/api/status/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  const session = getSession(sessionId);
+  
+  if (!session) {
+    return res.json({
+      status: 'not_found',
+      ready: false,
+      qr_available: false,
+      queue_length: 0,
+      timestamp: new Date().toISOString()
+    });
+  }
+
   res.json({
-    status: connectionStatus,
-    ready: isClientReady,
-    qr_available: !!qrCodeData,
-    queue_length: messageQueue.length,
+    status: session.status,
+    ready: session.isReady,
+    qr_available: !!session.qrCode,
+    queue_length: session.messageQueue.length,
     timestamp: new Date().toISOString()
   });
 });
 
-// Get QR code for authentication
-app.get('/api/qr', (req, res) => {
-  if (qrCodeData) {
+// Get QR code for specific session
+app.post('/api/qr/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  console.log(`🔍 QR request for session: ${sessionId}`);
+  
+  const session = getSession(sessionId);
+  if (!session) {
+    return res.json({
+      success: false,
+      message: 'Invalid session ID'
+    });
+  }
+
+  // Initialize client if not already done
+  if (!session.client) {
+    initializeClient(sessionId);
+    return res.json({
+      success: true,
+      message: 'Client initialization started. QR code will be available shortly.',
+      qr_code: null
+    });
+  }
+
+  if (session.qrCode) {
     res.json({
       success: true,
-      qr_code: qrCodeData,
+      qr_code: session.qrCode,
       message: 'Scan this QR code with WhatsApp'
+    });
+  } else if (session.isReady) {
+    res.json({
+      success: false,
+      message: 'WhatsApp is already connected for this session'
     });
   } else {
     res.json({
       success: false,
-      message: 'QR code not available. Status: ' + connectionStatus
+      message: `QR code not available. Status: ${session.status}`
     });
   }
 });
 
-// Reset WhatsApp session
-app.post('/api/reset', (req, res) => {
-  console.log('🔄 Resetting WhatsApp session...');
-  qrCodeData = null;
-  isClientReady = false;
-  connectionStatus = 'resetting';
-  if (client) {
-    try { client.destroy(); } catch (error) { console.error('Error destroying client:', error); }
+// Reset specific session
+app.post('/api/reset/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  console.log(`🔄 Resetting session: ${sessionId}`);
+  
+  const session = getSession(sessionId);
+  if (!session) {
+    return res.json({
+      success: false,
+      message: 'Session not found'
+    });
   }
-  setTimeout(() => { initializeClient(); }, 2000);
+
+  session.qrCode = null;
+  session.isReady = false;
+  session.status = 'resetting';
+  session.messageQueue = [];
+  
+  if (session.client) {
+    try { session.client.destroy(); } catch (error) { console.error('Error destroying client:', error); }
+  }
+  
+  setTimeout(() => { initializeClient(sessionId); }, 2000);
+  
   res.json({
     success: true,
-    message: 'WhatsApp session reset initiated. Get a new QR code in a few seconds.'
+    message: 'Session reset initiated. Get a new QR code in a few seconds.'
   });
 });
 
-// Send bulk messages
+// Send bulk messages for specific session
 app.post('/api/send-bulk-messages', async (req, res) => {
   const { messages } = req.body;
+  const sessionId = req.headers['x-session-id'];
+  
+  if (!sessionId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Session ID is required in X-Session-ID header'
+    });
+  }
+
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({
       success: false,
       error: 'Messages array is required and cannot be empty'
     });
   }
-  if (!isClientReady) {
+
+  const session = getSession(sessionId);
+  if (!session || !session.isReady) {
     return res.status(503).json({
       success: false,
-      error: 'WhatsApp client is not ready. Current status: ' + connectionStatus
+      error: 'WhatsApp client is not ready for this session. Current status: ' + (session?.status || 'not_found')
     });
   }
+
   const results = [];
   messages.forEach((msg, index) => {
     if (!msg.number || !msg.message) {
@@ -208,13 +320,15 @@ app.post('/api/send-bulk-messages', async (req, res) => {
       });
       return;
     }
+    
     const messageId = uuidv4();
-    messageQueue.push({
+    session.messageQueue.push({
       id: messageId,
       number: msg.number,
       message: msg.message,
       timestamp: new Date().toISOString()
     });
+    
     results.push({
       index,
       success: true,
@@ -222,30 +336,44 @@ app.post('/api/send-bulk-messages', async (req, res) => {
       status: 'queued'
     });
   });
-  processMessageQueue();
+
+  processMessageQueue(sessionId);
+  
   res.json({
     success: true,
     message: `${results.filter(r => r.success).length} messages queued successfully`,
     results,
-    queue_length: messageQueue.length
+    queue_length: session.messageQueue.length
   });
 });
 
-// Send event notifications
+// Send event notifications for specific session
 app.post('/api/send-event-messages', async (req, res) => {
   const { event, staff_list, staff_assignments } = req.body;
+  const sessionId = req.headers['x-session-id'];
+
+  if (!sessionId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Session ID is required in X-Session-ID header'
+    });
+  }
+
   if (!event || !Array.isArray(staff_list) || staff_list.length === 0) {
     return res.status(400).json({
       success: false,
       error: 'Event data and staff list are required'
     });
   }
-  if (!isClientReady) {
+
+  const session = getSession(sessionId);
+  if (!session || !session.isReady) {
     return res.status(503).json({
       success: false,
-      error: 'WhatsApp client is not ready. Current status: ' + connectionStatus
+      error: 'WhatsApp client is not ready for this session. Current status: ' + (session?.status || 'not_found')
     });
   }
+
   const staffDayAssignments = {};
   if (staff_assignments && Array.isArray(staff_assignments)) {
     staff_assignments.forEach(assignment => {
@@ -260,6 +388,7 @@ app.post('/api/send-event-messages', async (req, res) => {
       staffDayAssignments[staffId].sort((a, b) => a.day_number - b.day_number);
     });
   }
+
   const messages = [];
   staff_list.forEach(staff => {
     const assignments = staffDayAssignments[staff.id] || [];
@@ -283,11 +412,13 @@ app.post('/api/send-event-messages', async (req, res) => {
       });
     }
   });
+
   messages.sort((a, b) => a.day_number - b.day_number);
   const results = [];
+
   messages.forEach((msg, index) => {
     const messageId = uuidv4();
-    messageQueue.push({
+    session.messageQueue.push({
       id: messageId,
       number: msg.number,
       message: msg.message,
@@ -306,39 +437,54 @@ app.post('/api/send-event-messages', async (req, res) => {
       status: 'queued'
     });
   });
-  processMessageQueue();
+
+  processMessageQueue(sessionId);
+  
   res.json({
     success: true,
     message: `Event notifications queued for ${staff_list.length} staff members`,
     event_title: event.title,
     results,
-    queue_length: messageQueue.length
+    queue_length: session.messageQueue.length
   });
 });
 
-// Send task notifications
+// Send task notifications for specific session
 app.post('/api/send-task-messages', async (req, res) => {
   const { task, staff_list } = req.body;
+  const sessionId = req.headers['x-session-id'];
+
+  if (!sessionId) {
+    return res.status(400).json({
+      success: false,
+      error: 'Session ID is required in X-Session-ID header'
+    });
+  }
+
   if (!task || !Array.isArray(staff_list) || staff_list.length === 0) {
     return res.status(400).json({
       success: false,
       error: 'Task data and staff list are required'
     });
   }
-  if (!isClientReady) {
+
+  const session = getSession(sessionId);
+  if (!session || !session.isReady) {
     return res.status(503).json({
       success: false,
-      error: 'WhatsApp client is not ready. Current status: ' + connectionStatus
+      error: 'WhatsApp client is not ready for this session. Current status: ' + (session?.status || 'not_found')
     });
   }
+
   const messages = staff_list.map(staff => {
     const message = formatTaskMessage(task, staff);
     return { number: staff.mobile_number, message: message };
   });
+
   const results = [];
   messages.forEach((msg, index) => {
     const messageId = uuidv4();
-    messageQueue.push({
+    session.messageQueue.push({
       id: messageId,
       number: msg.number,
       message: msg.message,
@@ -354,33 +500,59 @@ app.post('/api/send-task-messages', async (req, res) => {
       status: 'queued'
     });
   });
-  processMessageQueue();
+
+  processMessageQueue(sessionId);
+
   res.json({
     success: true,
     message: `Task notifications queued for ${staff_list.length} staff members`,
     task_title: task.title,
     results,
-    queue_length: messageQueue.length
+    queue_length: session.messageQueue.length
   });
 });
 
-// Clear message queue
-app.post('/api/clear-queue', (req, res) => {
-  const queueLength = messageQueue.length;
-  messageQueue = [];
+// Clear message queue for specific session
+app.post('/api/clear-queue/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  const session = getSession(sessionId);
+  
+  if (!session) {
+    return res.json({
+      success: false,
+      message: 'Session not found'
+    });
+  }
+
+  const queueLength = session.messageQueue.length;
+  session.messageQueue = [];
+  
   res.json({
     success: true,
-    message: `Cleared ${queueLength} messages from queue`
+    message: `Cleared ${queueLength} messages from queue for session ${sessionId}`
   });
 });
 
-// Get queue status
-app.get('/api/queue', (req, res) => {
+// Get queue status for specific session
+app.get('/api/queue/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  const session = getSession(sessionId);
+  
+  if (!session) {
+    return res.json({
+      success: false,
+      queue_length: 0,
+      is_processing: false,
+      messages: [],
+      error: 'Session not found'
+    });
+  }
+
   res.json({
     success: true,
-    queue_length: messageQueue.length,
-    is_processing: isProcessingQueue,
-    messages: messageQueue.slice(0, 10)
+    queue_length: session.messageQueue.length,
+    is_processing: session.isProcessingQueue,
+    messages: session.messageQueue.slice(0, 10)
   });
 });
 
@@ -504,11 +676,19 @@ const formatTaskMessage = (task, staff) => {
   return message;
 };
 
-// Process queue every 30 seconds
+// Process queue every 30 seconds + cleanup old sessions
 cron.schedule('*/30 * * * * *', () => {
-  if (messageQueue.length > 0 && isClientReady && !isProcessingQueue) {
-    console.log('⏰ Cron: Processing message queue...');
-    processMessageQueue();
+  // Process message queues for all active sessions
+  for (const [sessionId, session] of sessions.entries()) {
+    if (session.messageQueue.length > 0 && session.isReady && !session.isProcessingQueue) {
+      console.log(`⏰ Cron: Processing message queue for session ${sessionId}...`);
+      processMessageQueue(sessionId);
+    }
+  }
+  
+  // Cleanup old sessions every 5 minutes
+  if (Date.now() % 300000 < 30000) { // Every ~5 minutes
+    cleanupOldSessions();
   }
 });
 
@@ -534,5 +714,6 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log(`🚀 WhatsApp Bulk Service running on port ${PORT}`);
   console.log(`📱 Health check: http://localhost:${PORT}/health`);
-  initializeClient();
+  console.log(`💡 Multi-session support enabled`);
+  // Don't initialize a global client anymore - clients are initialized per session
 });
