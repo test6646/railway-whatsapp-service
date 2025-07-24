@@ -145,10 +145,15 @@ const initializeClient = (sessionId) => {
     console.log(`⚠️ WhatsApp client disconnected for session ${sessionId}:`, reason);
     session.isReady = false;
     session.status = 'disconnected';
-    setTimeout(() => {
-      console.log(`🔄 Attempting to reconnect session: ${sessionId}`);
-      initializeClient(sessionId);
-    }, 5000);
+    // Only auto-reconnect for network issues, not manual disconnections
+    if (reason !== 'NAVIGATION' && reason !== 'LOGOUT') {
+      setTimeout(() => {
+        console.log(`🔄 Attempting to reconnect session: ${sessionId} (reason: ${reason})`);
+        if (sessions.has(sessionId) && sessions.get(sessionId).status !== 'manually_disconnected') {
+          initializeClient(sessionId);
+        }
+      }, 10000); // Increased delay to 10 seconds
+    }
   });
 
   session.client.initialize();
@@ -272,7 +277,12 @@ app.post('/api/reset/:sessionId', (req, res) => {
   session.messageQueue = [];
   
   if (session.client) {
-    try { session.client.destroy(); } catch (error) { console.error('Error destroying client:', error); }
+    try { 
+      session.client.destroy();
+      session.client = null;
+    } catch (error) { 
+      console.error('Error destroying client:', error); 
+    }
   }
   
   setTimeout(() => { initializeClient(sessionId); }, 2000);
@@ -280,6 +290,40 @@ app.post('/api/reset/:sessionId', (req, res) => {
   res.json({
     success: true,
     message: 'Session reset initiated. Get a new QR code in a few seconds.'
+  });
+});
+
+// Disconnect specific session (manual disconnection)
+app.post('/api/disconnect/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  console.log(`🔌 Manually disconnecting session: ${sessionId}`);
+  
+  const session = getSession(sessionId);
+  if (!session) {
+    return res.json({
+      success: false,
+      message: 'Session not found'
+    });
+  }
+
+  session.qrCode = null;
+  session.isReady = false;
+  session.status = 'manually_disconnected'; // Prevent auto-reconnection
+  session.messageQueue = [];
+  
+  if (session.client) {
+    try { 
+      session.client.logout(); // Proper logout to unlink device
+      session.client.destroy();
+      session.client = null;
+    } catch (error) { 
+      console.error('Error disconnecting client:', error); 
+    }
+  }
+  
+  res.json({
+    success: true,
+    message: 'Session disconnected and device unlinked successfully.'
   });
 });
 
