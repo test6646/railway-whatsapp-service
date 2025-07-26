@@ -1,67 +1,162 @@
 const express = require('express');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+const { Client, LocalAuth } = require('whatsapp-web.js');
 const QRCode = require('qrcode');
 const cors = require('cors');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
-const cron = require('node-cron');
+const fs = require('fs').promises;
+const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(helmet());
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+// Lightweight middleware setup
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['authorization', 'x-client-info', 'apikey', 'content-type', 'x-session-id']
+}));
+app.use(express.json({ limit: '5mb' }));
 
-// Session-based storage
-const sessions = new Map(); // sessionId -> { client, qrCode, isReady, status, messageQueue }
-const SESSION_TIMEOUT = 24 * 60 * 60 * 1000; // 24 hours
+// Persistent session storage configuration
+const SESSIONS_FILE = path.join(__dirname, 'persistent-sessions.json');
+const sessions = new Map(); // firmId -> { client, qrCode, isReady, status, messageQueue, lastActivity }
+const SESSION_TIMEOUT = 30 * 24 * 60 * 60 * 1000; // 30 days for permanent linking
+const HEARTBEAT_INTERVAL = 60000; // 1 minute heartbeat
 
-// Session management
-const getSession = (sessionId) => {
-  if (!sessionId) return null;
+// Persistent session storage functions
+const loadPersistedSessions = async () => {
+  try {
+    const data = await fs.readFile(SESSIONS_FILE, 'utf8');
+    const persistedSessions = JSON.parse(data);
+    
+    for (const [firmId, sessionData] of Object.entries(persistedSessions)) {
+      if (sessionData.isPersistent && sessionData.lastLinked) {
+        console.log(`🔄 Restoring persistent session for firm: ${firmId}`);
+        const sessionKey = `firm_${firmId}`;
+        
+        sessions.set(sessionKey, {
+          firmId,
+          client: null,
+          qrCode: null,
+          isReady: false,
+          status: 'restoring',
+          messageQueue: [],
+          isProcessingQueue: false,
+          lastActivity: Date.now(),
+          createdAt: sessionData.createdAt || Date.now(),
+          reconnectAttempts: 0,
+          maxReconnectAttempts: 5,
+          isPersistent: true,
+          lastLinked: sessionData.lastLinked
+        });
+        
+        // Initialize client for restored session
+        setTimeout(() => initializeClient(sessionKey), 2000);
+      }
+    }
+    
+    console.log(`✅ Restored ${Object.keys(persistedSessions).length} persistent sessions`);
+  } catch (error) {
+    console.log('📝 No existing persistent sessions file found, starting fresh');
+  }
+};
+
+const savePersistedSessions = async () => {
+  try {
+    const persistedData = {};
+    
+    for (const [sessionKey, session] of sessions.entries()) {
+      if (session.isPersistent && session.lastLinked) {
+        persistedData[session.firmId] = {
+          firmId: session.firmId,
+          isPersistent: true,
+          lastLinked: session.lastLinked,
+          createdAt: session.createdAt,
+          status: session.status
+        };
+      }
+    }
+    
+    await fs.writeFile(SESSIONS_FILE, JSON.stringify(persistedData, null, 2));
+    console.log(`💾 Saved ${Object.keys(persistedData).length} persistent sessions`);
+  } catch (error) {
+    console.error('❌ Error saving persistent sessions:', error);
+  }
+};
+
+// Optimized session management with firm-based isolation and persistence
+const getOrCreateSession = (firmId) => {
+  if (!firmId) return null;
   
-  if (!sessions.has(sessionId)) {
-    sessions.set(sessionId, {
+  const sessionKey = `firm_${firmId}`;
+  
+  if (!sessions.has(sessionKey)) {
+    sessions.set(sessionKey, {
+      firmId,
       client: null,
       qrCode: null,
       isReady: false,
-      status: 'initializing',
+      status: 'disconnected',
       messageQueue: [],
       isProcessingQueue: false,
-      createdAt: Date.now()
+      lastActivity: Date.now(),
+      createdAt: Date.now(),
+      reconnectAttempts: 0,
+      maxReconnectAttempts: 5,
+      isPersistent: false,
+      lastLinked: null
     });
   }
   
-  return sessions.get(sessionId);
+  // Update last activity
+  const session = sessions.get(sessionKey);
+  session.lastActivity = Date.now();
+  return session;
 };
 
-// Session-specific message queue processing
-const processMessageQueue = async (sessionId) => {
-  const session = getSession(sessionId);
+const getSession = (sessionId) => {
+  // Extract firm ID from session ID format: firm_<firmId>_<timestamp>_<random>
+  const firmMatch = sessionId?.match(/^firm_([^_]+)_/);
+  if (!firmMatch) return null;
+  
+  return getOrCreateSession(firmMatch[1]);
+};
+
+// Optimized message queue processing with better error handling
+const processMessageQueue = async (sessionKey) => {
+  const session = sessions.get(sessionKey);
   if (!session || session.isProcessingQueue || session.messageQueue.length === 0 || !session.isReady) return;
   
   session.isProcessingQueue = true;
-  console.log(`Processing ${session.messageQueue.length} messages for session ${sessionId}`);
+  const batchSize = Math.min(5, session.messageQueue.length); // Process in smaller batches
+  console.log(`📤 Processing ${batchSize} messages for firm ${session.firmId}`);
   
-  while (session.messageQueue.length > 0 && session.isReady) {
+  for (let i = 0; i < batchSize && session.isReady; i++) {
     const messageData = session.messageQueue.shift();
     try {
       const formattedNumber = formatPhoneNumber(messageData.number);
       const chatId = formattedNumber + '@c.us';
+      
       await session.client.sendMessage(chatId, messageData.message);
-      console.log(`✅ Message sent to ${formattedNumber} (session: ${sessionId})`);
-      if (messageData.statusCallback) messageData.statusCallback('sent');
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      console.log(`✅ Message sent to ${formattedNumber}`);
+      
+      // Longer delay to prevent rate limiting
+      await new Promise(resolve => setTimeout(resolve, 3000));
     } catch (error) {
       console.error(`❌ Failed to send message to ${messageData.number}:`, error.message);
-      if (messageData.statusCallback) messageData.statusCallback('failed', error.message);
+      
+      // If rate limited, re-queue the message
+      if (error.message.includes('rate') || error.message.includes('limit')) {
+        session.messageQueue.unshift(messageData);
+        console.log('🔄 Message re-queued due to rate limit');
+        await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 seconds
+        break;
+      }
     }
   }
+  
   session.isProcessingQueue = false;
-  console.log(`✅ Queue processing completed for session ${sessionId}`);
+  console.log(`✅ Batch processing completed for firm ${session.firmId}`);
 };
 
 // Format phone number to international format
@@ -73,14 +168,24 @@ const formatPhoneNumber = (phone) => {
   return digits;
 };
 
-// Initialize WhatsApp client for specific session
-const initializeClient = (sessionId) => {
-  console.log(`🚀 Initializing WhatsApp client for session: ${sessionId}`);
-  const session = getSession(sessionId);
-  if (!session) return;
+// Optimized WhatsApp client initialization with better resource management
+const initializeClient = (sessionKey) => {
+  const session = sessions.get(sessionKey);
+  if (!session || session.client) return;
+
+  console.log(`🚀 Initializing WhatsApp client for firm: ${session.firmId}`);
+  session.status = 'initializing';
+  session.reconnectAttempts++;
+
+  // Prevent too many reconnection attempts
+  if (session.reconnectAttempts > session.maxReconnectAttempts) {
+    console.log(`⚠️ Max reconnection attempts reached for firm ${session.firmId}`);
+    session.status = 'max_attempts_reached';
+    return;
+  }
 
   session.client = new Client({
-    authStrategy: new LocalAuth({ dataPath: `./whatsapp-session-${sessionId}` }),
+    authStrategy: new LocalAuth({ dataPath: `./whatsapp-session-firm-${session.firmId}` }),
     puppeteer: {
       headless: true,
       args: [
@@ -90,14 +195,17 @@ const initializeClient = (sessionId) => {
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
         '--no-zygote',
-        '--single-process',
-        '--disable-gpu'
-      ]
+        '--disable-gpu',
+        '--disable-web-security',
+        '--disable-features=VizDisplayCompositor'
+      ],
+      timeout: 60000 // 1 minute timeout
     }
   });
 
+  // QR event handler
   session.client.on('qr', (qr) => {
-    console.log(`📱 QR Code received for session: ${sessionId}`);
+    console.log(`📱 QR Code received for firm: ${session.firmId}`);
     session.status = 'qr_ready';
     QRCode.toDataURL(qr, {
       errorCorrectionLevel: 'M',
@@ -109,73 +217,145 @@ const initializeClient = (sessionId) => {
     }, (err, url) => {
       if (!err) {
         session.qrCode = url;
-        console.log(`✅ QR Code generated for session: ${sessionId}`);
+        console.log(`✅ QR Code generated for firm: ${session.firmId}`);
       } else {
-        console.error(`❌ QR Code generation failed for session ${sessionId}:`, err);
+        console.error(`❌ QR Code generation failed for firm ${session.firmId}:`, err);
+        session.status = 'qr_failed';
       }
     });
   });
 
+  // Ready event handler - Mark as persistent when successfully connected
   session.client.on('ready', () => {
-    console.log(`✅ WhatsApp client ready for session: ${sessionId}`);
+    console.log(`✅ WhatsApp client ready for firm: ${session.firmId}`);
     session.isReady = true;
     session.status = 'ready';
     session.qrCode = null;
+    session.reconnectAttempts = 0; // Reset reconnection attempts on successful connection
+    
+    // Mark session as persistent and save to disk
+    session.isPersistent = true;
+    session.lastLinked = new Date().toISOString();
+    savePersistedSessions();
+    
+    console.log(`🔗 Session permanently linked for firm: ${session.firmId}`);
   });
 
+  // Authentication event handler
   session.client.on('authenticated', () => {
-    console.log(`✅ WhatsApp client authenticated for session: ${sessionId}`);
+    console.log(`✅ WhatsApp client authenticated for firm: ${session.firmId}`);
     session.status = 'authenticated';
   });
 
+  // Auth failure event handler
   session.client.on('auth_failure', (msg) => {
-    console.error(`❌ Authentication failed for session ${sessionId}:`, msg);
+    console.error(`❌ Authentication failed for firm ${session.firmId}:`, msg);
     session.status = 'auth_failed';
+    session.qrCode = null;
   });
 
+  // Disconnection event handler with smart reconnection for persistent sessions
   session.client.on('disconnected', (reason) => {
-    console.log(`⚠️ WhatsApp client disconnected for session ${sessionId}:`, reason);
+    console.log(`⚠️ WhatsApp client disconnected for firm ${session.firmId}:`, reason);
     session.isReady = false;
     session.status = 'disconnected';
-    setTimeout(() => {
-      console.log(`🔄 Attempting to reconnect session: ${sessionId}`);
-      initializeClient(sessionId);
-    }, 5000);
+    session.qrCode = null;
+    
+    // For persistent sessions, always try to reconnect unless manually disconnected
+    if (session.isPersistent && session.status !== 'manually_disconnected') {
+      const reconnectDelay = Math.min(60000, 10000 * session.reconnectAttempts); // Longer delays for persistent sessions
+      console.log(`🔄 Auto-reconnecting persistent session for firm ${session.firmId} in ${reconnectDelay}ms`);
+      
+      setTimeout(() => {
+        if (sessions.has(sessionKey) && session.status !== 'manually_disconnected') {
+          console.log(`🔗 Restoring persistent link for firm ${session.firmId}`);
+          initializeClient(sessionKey);
+        }
+      }, reconnectDelay);
+    } else if (!session.isPersistent && reason !== 'NAVIGATION' && reason !== 'LOGOUT') {
+      // Normal reconnection logic for non-persistent sessions
+      const reconnectDelay = Math.min(30000, 5000 * session.reconnectAttempts);
+      setTimeout(() => {
+        if (sessions.has(sessionKey) && session.status !== 'manually_disconnected') {
+          initializeClient(sessionKey);
+        }
+      }, reconnectDelay);
+    }
   });
 
   session.client.initialize();
 };
 
-// Clean up old sessions
+// Optimized session cleanup - preserve persistent sessions
 const cleanupOldSessions = () => {
   const now = Date.now();
-  for (const [sessionId, session] of sessions.entries()) {
-    if (now - session.createdAt > SESSION_TIMEOUT) {
-      console.log(`🧹 Cleaning up old session: ${sessionId}`);
-      if (session.client) {
-        try { session.client.destroy(); } catch (e) { console.error('Error destroying client:', e); }
+  let cleanedCount = 0;
+  
+  for (const [sessionKey, session] of sessions.entries()) {
+    const isOld = (now - session.lastActivity) > SESSION_TIMEOUT;
+    const isVeryStale = (now - session.createdAt) > (SESSION_TIMEOUT * 3);
+    
+    // Never cleanup persistent sessions unless they're very stale AND not ready
+    if (session.isPersistent) {
+      if (isVeryStale && !session.isReady && session.status === 'disconnected') {
+        console.log(`🧹 Cleaning up stale persistent session for firm: ${session.firmId}`);
+        if (session.client) {
+          try { session.client.destroy(); } catch (e) { console.error('Error destroying client:', e); }
+        }
+        sessions.delete(sessionKey);
+        cleanedCount++;
       }
-      sessions.delete(sessionId);
+    } else {
+      // Regular cleanup for non-persistent sessions
+      if (isOld || isVeryStale) {
+        console.log(`🧹 Cleaning up temporary session for firm: ${session.firmId}`);
+        if (session.client) {
+          try { session.client.destroy(); } catch (e) { console.error('Error destroying client:', e); }
+        }
+        sessions.delete(sessionKey);
+        cleanedCount++;
+      }
+    }
+  }
+  
+  if (cleanedCount > 0) {
+    console.log(`🧹 Cleaned up ${cleanedCount} sessions. Active sessions: ${sessions.size}`);
+    savePersistedSessions(); // Save after cleanup
+  }
+};
+
+// Session heartbeat to keep active sessions alive
+const sessionHeartbeat = () => {
+  for (const [sessionKey, session] of sessions.entries()) {
+    if (session.isReady && session.client) {
+      // Simple heartbeat - just update last activity
+      session.lastActivity = Date.now();
     }
   }
 };
 
 // Routes
 
-// Health check
+// Optimized health check with better session info
 app.get('/health', (req, res) => {
-  const activeSessions = Array.from(sessions.entries()).map(([id, session]) => ({
-    id: id.substring(0, 20) + '...',
+  const sessionSummary = Array.from(sessions.entries()).map(([sessionKey, session]) => ({
+    firm_id: session.firmId,
     status: session.status,
     ready: session.isReady,
-    queue_length: session.messageQueue.length
+    persistent: session.isPersistent,
+    last_linked: session.lastLinked,
+    queue_length: session.messageQueue.length,
+    last_activity: Math.round((Date.now() - session.lastActivity) / 1000) + 's ago',
+    reconnect_attempts: session.reconnectAttempts
   }));
 
   res.json({
-    status: 'ok',
+    status: 'healthy',
     timestamp: new Date().toISOString(),
-    active_sessions: activeSessions.length,
-    sessions: activeSessions
+    uptime: process.uptime(),
+    memory_usage: process.memoryUsage(),
+    active_sessions: sessions.size,
+    sessions: sessionSummary
   });
 });
 
@@ -197,6 +377,8 @@ app.get('/api/status/:sessionId', (req, res) => {
   res.json({
     status: session.status,
     ready: session.isReady,
+    persistent: session.isPersistent,
+    last_linked: session.lastLinked,
     qr_available: !!session.qrCode,
     queue_length: session.messageQueue.length,
     timestamp: new Date().toISOString()
@@ -218,7 +400,8 @@ app.post('/api/qr/:sessionId', (req, res) => {
 
   // Initialize client if not already done
   if (!session.client) {
-    initializeClient(sessionId);
+    const sessionKey = `firm_${session.firmId}`;
+    initializeClient(sessionKey);
     return res.json({
       success: true,
       message: 'Client initialization started. QR code will be available shortly.',
@@ -264,14 +447,60 @@ app.post('/api/reset/:sessionId', (req, res) => {
   session.messageQueue = [];
   
   if (session.client) {
-    try { session.client.destroy(); } catch (error) { console.error('Error destroying client:', error); }
+    try { 
+      session.client.destroy();
+      session.client = null;
+    } catch (error) { 
+      console.error('Error destroying client:', error); 
+    }
   }
   
-  setTimeout(() => { initializeClient(sessionId); }, 2000);
+  const sessionKey = `firm_${session.firmId}`;
+  setTimeout(() => { initializeClient(sessionKey); }, 2000);
   
   res.json({
     success: true,
     message: 'Session reset initiated. Get a new QR code in a few seconds.'
+  });
+});
+
+// Enhanced disconnect endpoint for permanent unlinking
+app.post('/api/disconnect/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  console.log(`🔌 Permanently unlinking session: ${sessionId}`);
+  
+  const session = getSession(sessionId);
+  if (!session) {
+    return res.json({
+      success: false,
+      message: 'Session not found'
+    });
+  }
+
+  // Clear all session data and mark as manually disconnected
+  session.qrCode = null;
+  session.isReady = false;
+  session.status = 'manually_disconnected';
+  session.messageQueue = [];
+  session.isPersistent = false; // Remove persistence
+  session.lastLinked = null;
+  
+  if (session.client) {
+    try { 
+      session.client.logout(); // Proper logout to unlink device
+      session.client.destroy();
+      session.client = null;
+    } catch (error) { 
+      console.error('Error disconnecting client:', error); 
+    }
+  }
+  
+  // Save updated persistent sessions (this session will be excluded)
+  savePersistedSessions();
+  
+  res.json({
+    success: true,
+    message: 'Session permanently unlinked and device disconnected successfully.'
   });
 });
 
@@ -329,7 +558,8 @@ app.post('/api/send-bulk-messages', async (req, res) => {
     });
   });
 
-  processMessageQueue(sessionId);
+  const sessionKey = `firm_${session.firmId}`;
+  processMessageQueue(sessionKey);
   
   res.json({
     success: true,
@@ -430,7 +660,8 @@ app.post('/api/send-event-messages', async (req, res) => {
     });
   });
 
-  processMessageQueue(sessionId);
+  const sessionKey = `firm_${session.firmId}`;
+  processMessageQueue(sessionKey);
   
   res.json({
     success: true,
@@ -493,7 +724,8 @@ app.post('/api/send-task-messages', async (req, res) => {
     });
   });
 
-  processMessageQueue(sessionId);
+  const sessionKey = `firm_${session.firmId}`;
+  processMessageQueue(sessionKey);
 
   res.json({
     success: true,
@@ -668,21 +900,25 @@ const formatTaskMessage = (task, staff) => {
   return message;
 };
 
-// Process queue every 30 seconds + cleanup old sessions
-cron.schedule('*/30 * * * * *', () => {
-  // Process message queues for all active sessions
-  for (const [sessionId, session] of sessions.entries()) {
+// Optimized background tasks with better timing and persistence saving
+setInterval(() => {
+  // Process message queues for active sessions (every 45 seconds)
+  for (const [sessionKey, session] of sessions.entries()) {
     if (session.messageQueue.length > 0 && session.isReady && !session.isProcessingQueue) {
-      console.log(`⏰ Cron: Processing message queue for session ${sessionId}...`);
-      processMessageQueue(sessionId);
+      console.log(`⏰ Processing queue for firm ${session.firmId} (${session.messageQueue.length} messages)`);
+      processMessageQueue(sessionKey);
     }
   }
-  
-  // Cleanup old sessions every 5 minutes
-  if (Date.now() % 300000 < 30000) { // Every ~5 minutes
-    cleanupOldSessions();
-  }
-});
+}, 45000);
+
+// Session heartbeat (every minute)
+setInterval(sessionHeartbeat, HEARTBEAT_INTERVAL);
+
+// Cleanup old sessions (every 10 minutes)
+setInterval(cleanupOldSessions, 10 * 60 * 1000);
+
+// Save persistent sessions periodically (every 5 minutes)
+setInterval(savePersistedSessions, 5 * 60 * 1000);
 
 // Error handling
 app.use((error, req, res, next) => {
@@ -702,10 +938,17 @@ app.use((req, res) => {
   });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 WhatsApp Bulk Service running on port ${PORT}`);
+// Start optimized server with persistent session support
+app.listen(PORT, async () => {
+  console.log(`🚀 Ultra-Lightweight WhatsApp Service with Persistent Sessions running on port ${PORT}`);
   console.log(`📱 Health check: http://localhost:${PORT}/health`);
-  console.log(`💡 Multi-session support enabled`);
-  // Don't initialize a global client anymore - clients are initialized per session
+  console.log(`🏢 Firm-based session isolation enabled`);
+  console.log(`🔗 Permanent session linking enabled`);
+  console.log(`⚡ Optimized for minimal resource usage and better performance`);
+  
+  // Load persistent sessions on startup
+  await loadPersistedSessions();
+  
+  // Start cleanup after startup
+  setTimeout(cleanupOldSessions, 30000);
 });
