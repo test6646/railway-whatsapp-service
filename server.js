@@ -15,14 +15,6 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: 'Too many requests from this IP, please try again later.'
-});
-app.use('/api/', limiter);
-
 // Session-based storage
 const sessions = new Map(); // sessionId -> { client, qrCode, isReady, status, messageQueue }
 const SESSION_TIMEOUT = 24 * 60 * 60 * 1000; // 24 hours
